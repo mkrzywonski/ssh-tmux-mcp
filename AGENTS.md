@@ -40,3 +40,4 @@ PRs should include:
 ## Security & Configuration Tips
 - The MCP server trusts the SSH ControlMaster socket; it should only be used for intended sessions.
 - If you change socket or tmux defaults, update both `ai-ssh` and your Codex MCP server config.
+- Tmux log output is capped to `--max-log-size` bytes; older output is truncated to keep the last N bytes.

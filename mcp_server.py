@@ -3,17 +3,20 @@ import argparse
 import base64
 import json
 import os
+import posixpath
 import shlex
 import subprocess
 import sys
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 
 MAX_MESSAGE_BYTES = 2 * 1024 * 1024
 MAX_READ_BYTES = 10 * 1024 * 1024
 MAX_WRITE_B64 = 15 * 1024 * 1024
 MAX_PATCH_BYTES = 1 * 1024 * 1024
+DEFAULT_TIMEOUT = 30
+DEFAULT_MAX_LOG_BYTES = 25 * 1024 * 1024
 DEBUG = os.getenv("SSH_TMUX_MCP_DEBUG", "0") not in ("0", "", "false", "False")
 FRAMING = "lsp"
 
@@ -103,15 +106,21 @@ def send_message(payload: Dict[str, Any]) -> None:
     _log(f"send_message: lsp bytes={len(data)}")
 
 
-def _run_cmd(cmd: List[str], input_bytes: Optional[bytes] = None) -> Tuple[int, str, str]:
-    _log(f"run_cmd: {cmd!r} input_bytes={len(input_bytes) if input_bytes is not None else 0}")
-    proc = subprocess.run(
-        cmd,
-        input=input_bytes,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
+def _run_cmd(cmd: List[str], input_bytes: Optional[bytes] = None, timeout: Optional[int] = None) -> Tuple[int, str, str]:
+    if timeout is None:
+        timeout = DEFAULT_TIMEOUT
+    _log(f"run_cmd: {cmd!r} input_bytes={len(input_bytes) if input_bytes is not None else 0} timeout={timeout}")
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=input_bytes,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        raise MCPError(f"command timed out after {timeout}s: {cmd[0]}")
     _log(f"run_cmd: code={proc.returncode} stdout={len(proc.stdout)} stderr={len(proc.stderr)}")
     return proc.returncode, proc.stdout.decode("utf-8", errors="replace"), proc.stderr.decode("utf-8", errors="replace")
 
@@ -218,15 +227,220 @@ def _apply_unified_diff(original_text: str, patch_text: str) -> str:
     return "".join(out_lines)
 
 
-class SSHClient:
-    def __init__(self, host: Optional[str], socket_path: str, root: Optional[str], tmux_session: Optional[str]):
+def _find_sentinel_line(sentinel: str, data: str) -> Optional[Tuple[int, int, int]]:
+    """Search for a sentinel marker line in captured output.
+
+    Returns (cut_index, line_end, exit_code) or None.
+    """
+    if data.startswith(sentinel):
+        line_end = data.find("\n", 0)
+        if line_end == -1:
+            return None
+        code_str = data[len(sentinel):line_end].strip().strip("\r")
+        return (0, line_end, int(code_str)) if code_str.isdigit() else None
+    for needle, start_offset in (("\r\n", 2), ("\n", 1), ("\r", 1)):
+        idx = data.find(f"{needle}{sentinel}")
+        if idx == -1:
+            continue
+        line_start = idx + start_offset
+        line_end = data.find("\n", line_start)
+        if line_end == -1:
+            return None
+        code_str = data[line_start + len(sentinel):line_end].strip().strip("\r")
+        if not code_str.isdigit():
+            return None
+        return (idx, line_end, int(code_str))
+    return None
+
+
+class TmuxClientBase:
+    """Shared tmux session logic for both SSH and local modes.
+
+    Subclasses must implement:
+      _run_tmux(tmux_shell_cmd) -> str  — run a full tmux command string
+      _read_stream_from_offset(log_path, offset, max_bytes) -> dict
+      _get_log_path() -> str
+      _ensure_tmux_session(session) -> str
+    """
+
+    def __init__(self, max_log_bytes: int = DEFAULT_MAX_LOG_BYTES) -> None:
+        self._log_offsets: Dict[str, int] = {}
+        self.max_log_bytes = max_log_bytes
+
+    def _run_tmux(self, tmux_shell_cmd: str) -> str:
+        raise NotImplementedError
+
+    def _read_stream_from_offset(self, log_path: str, offset: int, max_bytes: int) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    def _get_log_path(self) -> str:
+        raise NotImplementedError
+
+    def _ensure_tmux_session(self, session: Optional[str]) -> str:
+        raise NotImplementedError
+
+    def _truncate_log_if_needed(self, log_path: str) -> None:
+        """Truncate the log file in place if it exceeds max_log_bytes."""
+        raise NotImplementedError
+
+    def tmux_log_purge(self) -> Dict[str, Any]:
+        """Purge the tmux log file entirely (e.g. to remove sensitive output)."""
+        raise NotImplementedError
+
+    def _send_keys_with_sentinel(self, quoted_session: str, key_arg: str, marker_cmd: str) -> None:
+        """Send command + sentinel marker to tmux. SSH subclass combines into one call."""
+        self._run_tmux(f"tmux send-keys -t {quoted_session} -- {key_arg} C-m")
+        self._run_tmux(f"tmux send-keys -t {quoted_session} -- {marker_cmd} C-m")
+
+    def tmux_capture(self, session: Optional[str], lines: Optional[int]) -> Dict[str, Any]:
+        sess = self._ensure_tmux_session(session)
+        quoted = shlex.quote(sess)
+        if lines is not None:
+            out = self._run_tmux(f"tmux capture-pane -p -t {quoted} -S -{int(lines)}")
+        else:
+            out = self._run_tmux(f"tmux capture-pane -p -t {quoted}")
+        return {"content": out}
+
+    def tmux_capture_scrollback(self, session: Optional[str], max_lines: Optional[int]) -> Dict[str, Any]:
+        sess = self._ensure_tmux_session(session)
+        quoted = shlex.quote(sess)
+        if max_lines is not None:
+            out = self._run_tmux(f"tmux capture-pane -p -t {quoted} -S -{int(max_lines)}")
+        else:
+            out = self._run_tmux(f"tmux capture-pane -p -t {quoted} -S -")
+        return {"content": out}
+
+    def tmux_send(self, session: Optional[str], keys: str, enter: bool) -> Dict[str, Any]:
+        sess = self._ensure_tmux_session(session)
+        quoted = shlex.quote(sess)
+        key_arg = shlex.quote(keys)
+        if enter:
+            self._run_tmux(f"tmux send-keys -t {quoted} -- {key_arg} C-m")
+        else:
+            self._run_tmux(f"tmux send-keys -t {quoted} -- {key_arg}")
+        return {"ok": True}
+
+    def tmux_run(self, session: Optional[str], command: str, lines: int, delay_ms: int) -> Dict[str, Any]:
+        sess = self._ensure_tmux_session(session)
+        quoted = shlex.quote(sess)
+        key_arg = shlex.quote(command)
+        self._run_tmux(f"tmux send-keys -t {quoted} -- {key_arg} C-m")
+        if delay_ms > 0:
+            time.sleep(delay_ms / 1000.0)
+        out = self._run_tmux(f"tmux capture-pane -p -t {quoted} -S -{int(lines)}")
+        return {"content": out}
+
+    def tmux_stream_read(self, session: Optional[str], max_bytes: int, reset: bool) -> Dict[str, Any]:
+        self._ensure_tmux_session(session)
+        log_path = self._get_log_path()
+        offset = 0 if reset else self._log_offsets.get(log_path, 0)
+        result = self._read_stream_from_offset(log_path, offset, max_bytes)
+        self._log_offsets[log_path] = result["offset"]
+        if result.get("size", 0) > self.max_log_bytes:
+            self._truncate_log_if_needed(log_path)
+        return result
+
+    def tmux_run_stream(self, session: Optional[str], command: str, max_bytes: int, delay_ms: int) -> Dict[str, Any]:
+        sess = self._ensure_tmux_session(session)
+        log_path = self._get_log_path()
+        quoted = shlex.quote(sess)
+        key_arg = shlex.quote(command)
+        start = self._read_stream_from_offset(log_path, 0, 0)["size"]
+        self._run_tmux(f"tmux send-keys -t {quoted} -- {key_arg} C-m")
+        if delay_ms > 0:
+            time.sleep(delay_ms / 1000.0)
+        result = self._read_stream_from_offset(log_path, start, max_bytes)
+        self._log_offsets[log_path] = result["offset"]
+        if result.get("size", 0) > self.max_log_bytes:
+            self._truncate_log_if_needed(log_path)
+        return result
+
+    def tmux_run_sentinel(
+        self,
+        session: Optional[str],
+        command: str,
+        max_bytes: int,
+        delay_ms: int,
+        timeout_ms: int,
+        poll_ms: int,
+    ) -> Dict[str, Any]:
+        sess = self._ensure_tmux_session(session)
+        log_path = self._get_log_path()
+        quoted = shlex.quote(sess)
+        key_arg = shlex.quote(command)
+        token = f"__AI_SENTINEL__{os.getpid()}_{int(time.time())}_{os.urandom(6).hex()}"
+        sentinel = f"{token}:"
+        marker_cmd = shlex.quote(f"printf '\\n{token}:%s\\n' \"$?\"")
+
+        start = self._read_stream_from_offset(log_path, 0, 0)["size"]
+        self._send_keys_with_sentinel(quoted, key_arg, marker_cmd)
+        if delay_ms > 0:
+            time.sleep(delay_ms / 1000.0)
+
+        deadline = time.time() + max(0, timeout_ms) / 1000.0
+        offset = start
+        content = ""
+        exit_code: Optional[int] = None
+        truncated = False
+        last_size = start
+
+        while True:
+            remaining = max_bytes - len(content)
+            if remaining <= 0:
+                truncated = True
+                break
+            result = self._read_stream_from_offset(log_path, offset, min(remaining, 8192))
+            offset = result["offset"]
+            last_size = result.get("size", last_size)
+            if result["content"]:
+                content += result["content"]
+                found = _find_sentinel_line(sentinel, content)
+                if found is not None:
+                    cut_idx, _line_end, exit_code = found
+                    content = content[:cut_idx]
+                    break
+            if timeout_ms <= 0:
+                break
+            if time.time() >= deadline:
+                break
+            time.sleep(max(0, poll_ms) / 1000.0)
+
+        if content:
+            cleaned_lines = []
+            for line in content.splitlines():
+                if token in line:
+                    continue
+                cleaned_lines.append(line)
+            content = "\n".join(cleaned_lines)
+
+        self._log_offsets[log_path] = offset
+        if last_size > self.max_log_bytes:
+            self._truncate_log_if_needed(log_path)
+        return {
+            "content": content,
+            "exit_code": exit_code,
+            "timed_out": timeout_ms > 0 and time.time() >= deadline and exit_code is None,
+            "truncated": truncated,
+            "sentinel": token,
+        }
+
+    def tmux_cwd(self, session: Optional[str]) -> Dict[str, Any]:
+        sess = self._ensure_tmux_session(session)
+        quoted = shlex.quote(sess)
+        out = self._run_tmux(f"tmux display-message -p -t {quoted} '#{{pane_current_path}}'").strip()
+        return {"cwd": out}
+
+
+class SSHClient(TmuxClientBase):
+    def __init__(self, host: Optional[str], socket_path: str, root: Optional[str], tmux_session: Optional[str], timeout: int = DEFAULT_TIMEOUT, max_log_bytes: int = DEFAULT_MAX_LOG_BYTES):
+        super().__init__(max_log_bytes=max_log_bytes)
         self.host = host
         self.socket_path = socket_path
-        self.root = os.path.normpath(root) if root is not None else None
+        self.root = posixpath.normpath(root) if root is not None else None
         self.tmux_session = tmux_session
+        self.timeout = timeout
         self.info_path = f"{socket_path}.info"
         self.log_path: Optional[str] = None
-        self._log_offsets: Dict[str, int] = {}
 
     def _refresh_info(self) -> None:
         info = _read_socket_info(self.socket_path)
@@ -247,7 +461,7 @@ class SSHClient:
             raise ControlMasterGone(f"SSH control socket not found: {self.socket_path}")
         if self.host is None:
             raise MCPError(f"session info not found: {self.info_path}")
-        code, _out, _err = _run_cmd(["ssh", "-S", self.socket_path, "-O", "check", self.host])
+        code, _out, _err = _run_cmd(["ssh", "-S", self.socket_path, "-O", "check", self.host], timeout=10)
         if code != 0:
             raise ControlMasterGone("SSH ControlMaster not responding")
 
@@ -260,7 +474,7 @@ class SSHClient:
             raise MCPError(f"session info not found: {self.info_path}")
         return self.tmux_session
 
-    def _ensure_log_path(self) -> str:
+    def _get_log_path(self) -> str:
         if self.log_path is None:
             try:
                 self._refresh_info()
@@ -269,6 +483,9 @@ class SSHClient:
         if self.log_path is None:
             self.log_path = "/tmp/ai-ssh/tmux.log"
         return self.log_path
+
+    def _run_tmux(self, tmux_shell_cmd: str) -> str:
+        return self.ssh(tmux_shell_cmd)
 
     def _read_stream_from_offset(self, log_path: str, offset: int, max_bytes: int) -> Dict[str, Any]:
         quoted = shlex.quote(log_path)
@@ -282,7 +499,7 @@ class SSHClient:
         to_read = min(max_bytes, max(0, size - offset))
         if to_read == 0:
             return {"content": "", "offset": offset, "size": size, "truncated": False}
-        cmd = f"dd if={quoted} bs=1 skip={int(offset)} count={int(to_read)} 2>/dev/null"
+        cmd = f"tail -c +{int(offset) + 1} -- {quoted} | head -c {int(to_read)}"
         out = self.ssh(cmd)
         new_offset = offset + to_read
         return {
@@ -307,15 +524,15 @@ class SSHClient:
         if self.root is None:
             return path
         root = self.root
-        target = os.path.normpath(os.path.join(root, path.lstrip("/")))
-        if os.path.commonpath([root, target]) != root:
+        target = posixpath.normpath(posixpath.join(root, path.lstrip("/")))
+        if posixpath.commonpath([root, target]) != root:
             raise MCPError("Path escapes configured root")
         return target
 
-    def ssh(self, remote_cmd: str, input_bytes: Optional[bytes] = None) -> str:
+    def ssh(self, remote_cmd: str, input_bytes: Optional[bytes] = None, timeout: Optional[int] = None) -> str:
         self._check_socket()
         cmd = self._ssh_base() + [remote_cmd]
-        code, out, err = _run_cmd(cmd, input_bytes=input_bytes)
+        code, out, err = _run_cmd(cmd, input_bytes=input_bytes, timeout=timeout or self.timeout)
         if code != 0:
             raise MCPError(err.strip() or f"ssh command failed: {remote_cmd}")
         return out
@@ -334,7 +551,8 @@ class SSHClient:
         if offset is not None or length is not None:
             off = offset or 0
             cnt = "" if length is None else f" count={int(length)}"
-            cmd = f"dd if={quoted} bs=1 skip={int(off)}{cnt} 2>/dev/null | base64 -w 0"
+            head_arg = f" | head -c {int(length)}" if length is not None else ""
+            cmd = f"tail -c +{int(off) + 1} -- {quoted}{head_arg} | base64 -w 0"
         else:
             cmd = f"base64 -w 0 -- {quoted}"
         out = self.ssh(cmd)
@@ -345,7 +563,8 @@ class SSHClient:
             raise MCPError(f"write exceeds {MAX_WRITE_B64} base64 bytes")
         path = self._normalize_path(path)
         quoted = shlex.quote(path)
-        cmd = f"base64 -d > {quoted}"
+        dir_quoted = shlex.quote(path.rsplit("/", 1)[0] if "/" in path else ".")
+        cmd = f"__tmp=$(mktemp -p {dir_quoted}) && base64 -d > \"$__tmp\" && mv \"$__tmp\" {quoted}"
         self.ssh(cmd, input_bytes=content_b64.encode("utf-8"))
         return {"ok": True}
 
@@ -430,186 +649,77 @@ class SSHClient:
         self.ssh(cmd)
         return {"ok": True}
 
-    def tmux_capture(self, session: Optional[str], lines: Optional[int]) -> Dict[str, Any]:
-        sess = self._ensure_tmux_session(session)
-        quoted = shlex.quote(sess)
-        if lines is not None:
-            cmd = f"tmux capture-pane -p -t {quoted} -S -{int(lines)}"
-        else:
-            cmd = f"tmux capture-pane -p -t {quoted}"
-        out = self.ssh(cmd)
-        return {"content": out}
-
-    def tmux_capture_scrollback(self, session: Optional[str], max_lines: Optional[int]) -> Dict[str, Any]:
-        sess = self._ensure_tmux_session(session)
-        quoted = shlex.quote(sess)
-        if max_lines is not None:
-            cmd = f"tmux capture-pane -p -t {quoted} -S -{int(max_lines)}"
-        else:
-            cmd = f"tmux capture-pane -p -t {quoted} -S -"
-        out = self.ssh(cmd)
-        return {"content": out}
-
-    def tmux_send(self, session: Optional[str], keys: str, enter: bool) -> Dict[str, Any]:
-        sess = self._ensure_tmux_session(session)
-        quoted = shlex.quote(sess)
-        key_arg = shlex.quote(keys)
-        cmd = f"tmux send-keys -t {quoted} -- {key_arg}"
-        self.ssh(cmd)
-        if enter:
-            self.ssh(f"tmux send-keys -t {quoted} C-m")
-        return {"ok": True}
-
     def tmux_run(self, session: Optional[str], command: str, lines: int, delay_ms: int) -> Dict[str, Any]:
         sess = self._ensure_tmux_session(session)
         quoted = shlex.quote(sess)
         key_arg = shlex.quote(command)
-        self.ssh(f"tmux send-keys -t {quoted} -- {key_arg}")
-        self.ssh(f"tmux send-keys -t {quoted} C-m")
-        if delay_ms > 0:
-            time.sleep(delay_ms / 1000.0)
-        capture_cmd = f"tmux capture-pane -p -t {quoted} -S -{int(lines)}"
-        out = self.ssh(capture_cmd)
+        delay_arg = f"sleep {delay_ms / 1000.0} && " if delay_ms > 0 else ""
+        cmd = (
+            f"tmux send-keys -t {quoted} -- {key_arg} C-m && "
+            f"{delay_arg}"
+            f"tmux capture-pane -p -t {quoted} -S -{int(lines)}"
+        )
+        out = self.ssh(cmd)
         return {"content": out}
 
-    def tmux_stream_read(self, session: Optional[str], max_bytes: int, reset: bool) -> Dict[str, Any]:
-        try:
-            _ = self._ensure_tmux_session(session)
-        except MCPError:
-            # Stream reads only need the log path.
-            pass
-        log_path = self._ensure_log_path()
-        offset = 0 if reset else self._log_offsets.get(log_path, 0)
-        result = self._read_stream_from_offset(log_path, offset, max_bytes)
-        self._log_offsets[log_path] = result["offset"]
-        return result
-
-    def tmux_run_stream(self, session: Optional[str], command: str, max_bytes: int, delay_ms: int) -> Dict[str, Any]:
-        sess = self._ensure_tmux_session(session)
-        log_path = self._ensure_log_path()
-        quoted = shlex.quote(sess)
-        key_arg = shlex.quote(command)
-        start = self._read_stream_from_offset(log_path, 0, 0)["size"]
-        self.ssh(f"tmux send-keys -t {quoted} -- {key_arg}")
-        self.ssh(f"tmux send-keys -t {quoted} C-m")
-        if delay_ms > 0:
-            time.sleep(delay_ms / 1000.0)
-        result = self._read_stream_from_offset(log_path, start, max_bytes)
-        self._log_offsets[log_path] = result["offset"]
-        return result
-
-    def tmux_run_sentinel(
-        self,
-        session: Optional[str],
-        command: str,
-        max_bytes: int,
-        delay_ms: int,
-        timeout_ms: int,
-        poll_ms: int,
-    ) -> Dict[str, Any]:
-        sess = self._ensure_tmux_session(session)
-        log_path = self._ensure_log_path()
-        quoted = shlex.quote(sess)
-        key_arg = shlex.quote(command)
-        token = f"__AI_SENTINEL__{os.getpid()}_{int(time.time())}_{os.urandom(6).hex()}"
-        sentinel = f"{token}:"
-        marker_cmd = f"printf '\\n{token}:%s\\n' \"$?\""
-
-        start = self._read_stream_from_offset(log_path, 0, 0)["size"]
-        self.ssh(f"tmux send-keys -t {quoted} -- {key_arg}")
-        self.ssh(f"tmux send-keys -t {quoted} C-m")
-        self.ssh(f"tmux send-keys -t {quoted} -- {shlex.quote(marker_cmd)}")
-        self.ssh(f"tmux send-keys -t {quoted} C-m")
-        if delay_ms > 0:
-            time.sleep(delay_ms / 1000.0)
-
-        deadline = time.time() + max(0, timeout_ms) / 1000.0
-        offset = start
-        content = ""
-        exit_code: Optional[int] = None
-        truncated = False
-
-        def _find_sentinel_line(data: str) -> Optional[Tuple[int, int, int]]:
-            if data.startswith(sentinel):
-                line_end = data.find("\n", 0)
-                if line_end == -1:
-                    return None
-                code_str = data[len(sentinel):line_end].strip().strip("\r")
-                return (0, line_end, int(code_str)) if code_str.isdigit() else None
-            for needle, start_offset in (("\r\n", 2), ("\n", 1), ("\r", 1)):
-                idx = data.find(f"{needle}{sentinel}")
-                if idx == -1:
-                    continue
-                line_start = idx + start_offset
-                line_end = data.find("\n", line_start)
-                if line_end == -1:
-                    return None
-                code_str = data[line_start + len(sentinel):line_end].strip().strip("\r")
-                if not code_str.isdigit():
-                    return None
-                return (idx, line_end, int(code_str))
-            return None
-
-        while True:
-            remaining = max_bytes - len(content)
-            if remaining <= 0:
-                truncated = True
-                break
-            result = self._read_stream_from_offset(log_path, offset, min(remaining, 8192))
-            offset = result["offset"]
-            if result["content"]:
-                content += result["content"]
-                found = _find_sentinel_line(content)
-                if found is not None:
-                    cut_idx, _line_end, exit_code = found
-                    content = content[:cut_idx]
-                    break
-            if timeout_ms <= 0:
-                break
-            if time.time() >= deadline:
-                break
-            time.sleep(max(0, poll_ms) / 1000.0)
-
-        if content:
-            cleaned_lines = []
-            for line in content.splitlines():
-                if token in line and "printf" in line:
-                    continue
-                cleaned_lines.append(line)
-            content = "\n".join(cleaned_lines)
-
-        self._log_offsets[log_path] = offset
-        return {
-            "content": content,
-            "exit_code": exit_code,
-            "timed_out": timeout_ms > 0 and time.time() >= deadline and exit_code is None,
-            "truncated": truncated,
-            "sentinel": token,
-        }
-
-    def tmux_cwd(self, session: Optional[str]) -> Dict[str, Any]:
-        sess = self._ensure_tmux_session(session)
-        quoted = shlex.quote(sess)
-        cmd = f"tmux display-message -p -t {quoted} '#{{pane_current_path}}'"
-        out = self.ssh(cmd).strip()
-        return {"cwd": out}
+    def _send_keys_with_sentinel(self, quoted_session: str, key_arg: str, marker_cmd: str) -> None:
+        self.ssh(
+            f"tmux send-keys -t {quoted_session} -- {key_arg} C-m && "
+            f"tmux send-keys -t {quoted_session} -- {marker_cmd} C-m"
+        )
 
     def ssh_exec(self, command: str) -> Dict[str, Any]:
         out = self.ssh(command)
         return {"content": out}
 
+    def _truncate_log_if_needed(self, log_path: str) -> None:
+        quoted = shlex.quote(log_path)
+        size_out = self.ssh(f"stat -Lc '%s' -- {quoted}").strip()
+        try:
+            size = int(size_out)
+        except ValueError:
+            return
+        if size <= self.max_log_bytes:
+            return
+        dir_quoted = shlex.quote(posixpath.dirname(log_path) or ".")
+        cmd = (
+            f"__tmp=$(mktemp -p {dir_quoted}) && "
+            f"tail -c {int(self.max_log_bytes)} -- {quoted} > \"$__tmp\" && "
+            f"mv \"$__tmp\" {quoted}"
+        )
+        self.ssh(cmd)
+        self._log_offsets[log_path] = min(self.max_log_bytes, size)
 
-class LocalClient:
-    def __init__(self, tmux_session: Optional[str], log_path: Optional[str]) -> None:
+    def tmux_log_purge(self) -> Dict[str, Any]:
+        log_path = self._get_log_path()
+        quoted = shlex.quote(log_path)
+        self.ssh(f": > {quoted}")
+        self._log_offsets[log_path] = 0
+        return {"ok": True, "purged": log_path}
+
+
+class LocalClient(TmuxClientBase):
+    def __init__(self, tmux_session: Optional[str], log_path: Optional[str], timeout: int = DEFAULT_TIMEOUT, max_log_bytes: int = DEFAULT_MAX_LOG_BYTES) -> None:
+        super().__init__(max_log_bytes=max_log_bytes)
         self.tmux_session = tmux_session or "shared-ai"
         self.log_path = log_path or "/tmp/ai-ssh/tmux.log"
-        self._log_offsets: Dict[str, int] = {}
+        self.timeout = timeout
 
-    def _run_local(self, cmd: List[str]) -> Tuple[int, str, str]:
-        return _run_cmd(cmd)
+    def _run_local(self, cmd: List[str], timeout: Optional[int] = None) -> Tuple[int, str, str]:
+        return _run_cmd(cmd, timeout=timeout or self.timeout)
 
     def _ensure_tmux_session(self, session: Optional[str]) -> str:
         return session or self.tmux_session
+
+    def _get_log_path(self) -> str:
+        return self.log_path
+
+    def _run_tmux(self, tmux_shell_cmd: str) -> str:
+        # Run a full tmux command string locally via shell to preserve quoting.
+        code, out, err = self._run_local(["bash", "-c", tmux_shell_cmd])
+        if code != 0:
+            raise MCPError(err.strip() or "tmux command failed")
+        return out
 
     def _read_stream_from_offset(self, log_path: str, offset: int, max_bytes: int) -> Dict[str, Any]:
         try:
@@ -631,151 +741,32 @@ class LocalClient:
             "truncated": (size - offset) > max_bytes,
         }
 
-    def _tmux(self, args: List[str]) -> str:
-        code, out, err = self._run_local(["tmux"] + args)
-        if code != 0:
-            raise MCPError(err.strip() or "tmux command failed")
-        return out
+    def _truncate_log_if_needed(self, log_path: str) -> None:
+        try:
+            size = os.path.getsize(log_path)
+        except OSError:
+            return
+        if size <= self.max_log_bytes:
+            return
+        keep = min(self.max_log_bytes, size)
+        try:
+            with open(log_path, "rb") as handle:
+                handle.seek(size - keep)
+                tail = handle.read(keep)
+            with open(log_path, "wb") as handle:
+                handle.write(tail)
+        except OSError:
+            return
+        self._log_offsets[log_path] = keep
 
-    def tmux_capture(self, session: Optional[str], lines: Optional[int]) -> Dict[str, Any]:
-        sess = self._ensure_tmux_session(session)
-        target = ["capture-pane", "-p", "-t", sess]
-        if lines is not None:
-            target.extend(["-S", f"-{int(lines)}"])
-        out = self._tmux(target)
-        return {"content": out}
-
-    def tmux_capture_scrollback(self, session: Optional[str], max_lines: Optional[int]) -> Dict[str, Any]:
-        sess = self._ensure_tmux_session(session)
-        target = ["capture-pane", "-p", "-t", sess, "-S"]
-        target.append(f"-{int(max_lines)}" if max_lines is not None else "-")
-        out = self._tmux(target)
-        return {"content": out}
-
-    def tmux_send(self, session: Optional[str], keys: str, enter: bool) -> Dict[str, Any]:
-        sess = self._ensure_tmux_session(session)
-        self._tmux(["send-keys", "-t", sess, "--", keys])
-        if enter:
-            self._tmux(["send-keys", "-t", sess, "C-m"])
-        return {"ok": True}
-
-    def tmux_run(self, session: Optional[str], command: str, lines: int, delay_ms: int) -> Dict[str, Any]:
-        sess = self._ensure_tmux_session(session)
-        self._tmux(["send-keys", "-t", sess, "--", command])
-        self._tmux(["send-keys", "-t", sess, "C-m"])
-        if delay_ms > 0:
-            time.sleep(delay_ms / 1000.0)
-        out = self._tmux(["capture-pane", "-p", "-t", sess, "-S", f"-{int(lines)}"])
-        return {"content": out}
-
-    def tmux_stream_read(self, session: Optional[str], max_bytes: int, reset: bool) -> Dict[str, Any]:
-        _ = self._ensure_tmux_session(session)
-        offset = 0 if reset else self._log_offsets.get(self.log_path, 0)
-        result = self._read_stream_from_offset(self.log_path, offset, max_bytes)
-        self._log_offsets[self.log_path] = result["offset"]
-        return result
-
-    def tmux_run_stream(self, session: Optional[str], command: str, max_bytes: int, delay_ms: int) -> Dict[str, Any]:
-        sess = self._ensure_tmux_session(session)
-        start = self._read_stream_from_offset(self.log_path, 0, 0)["size"]
-        self._tmux(["send-keys", "-t", sess, "--", command])
-        self._tmux(["send-keys", "-t", sess, "C-m"])
-        if delay_ms > 0:
-            time.sleep(delay_ms / 1000.0)
-        result = self._read_stream_from_offset(self.log_path, start, max_bytes)
-        self._log_offsets[self.log_path] = result["offset"]
-        return result
-
-    def tmux_run_sentinel(
-        self,
-        session: Optional[str],
-        command: str,
-        max_bytes: int,
-        delay_ms: int,
-        timeout_ms: int,
-        poll_ms: int,
-    ) -> Dict[str, Any]:
-        sess = self._ensure_tmux_session(session)
-        token = f"__AI_SENTINEL__{os.getpid()}_{int(time.time())}_{os.urandom(6).hex()}"
-        sentinel = f"{token}:"
-        marker_cmd = f"printf '\\n{token}:%s\\n' \"$?\""
-
-        start = self._read_stream_from_offset(self.log_path, 0, 0)["size"]
-        self._tmux(["send-keys", "-t", sess, "--", command])
-        self._tmux(["send-keys", "-t", sess, "C-m"])
-        self._tmux(["send-keys", "-t", sess, "--", marker_cmd])
-        self._tmux(["send-keys", "-t", sess, "C-m"])
-        if delay_ms > 0:
-            time.sleep(delay_ms / 1000.0)
-
-        deadline = time.time() + max(0, timeout_ms) / 1000.0
-        offset = start
-        content = ""
-        exit_code: Optional[int] = None
-        truncated = False
-
-        def _find_sentinel_line(data: str) -> Optional[Tuple[int, int, int]]:
-            if data.startswith(sentinel):
-                line_end = data.find("\n", 0)
-                if line_end == -1:
-                    return None
-                code_str = data[len(sentinel):line_end].strip().strip("\r")
-                return (0, line_end, int(code_str)) if code_str.isdigit() else None
-            for needle, start_offset in (("\r\n", 2), ("\n", 1), ("\r", 1)):
-                idx = data.find(f"{needle}{sentinel}")
-                if idx == -1:
-                    continue
-                line_start = idx + start_offset
-                line_end = data.find("\n", line_start)
-                if line_end == -1:
-                    return None
-                code_str = data[line_start + len(sentinel):line_end].strip().strip("\r")
-                if not code_str.isdigit():
-                    return None
-                return (idx, line_end, int(code_str))
-            return None
-
-        while True:
-            remaining = max_bytes - len(content)
-            if remaining <= 0:
-                truncated = True
-                break
-            result = self._read_stream_from_offset(self.log_path, offset, min(remaining, 8192))
-            offset = result["offset"]
-            if result["content"]:
-                content += result["content"]
-                found = _find_sentinel_line(content)
-                if found is not None:
-                    cut_idx, _line_end, exit_code = found
-                    content = content[:cut_idx]
-                    break
-            if timeout_ms <= 0:
-                break
-            if time.time() >= deadline:
-                break
-            time.sleep(max(0, poll_ms) / 1000.0)
-
-        if content:
-            cleaned_lines = []
-            for line in content.splitlines():
-                if token in line and "printf" in line:
-                    continue
-                cleaned_lines.append(line)
-            content = "\n".join(cleaned_lines)
-
-        self._log_offsets[self.log_path] = offset
-        return {
-            "content": content,
-            "exit_code": exit_code,
-            "timed_out": timeout_ms > 0 and time.time() >= deadline and exit_code is None,
-            "truncated": truncated,
-            "sentinel": token,
-        }
-
-    def tmux_cwd(self, session: Optional[str]) -> Dict[str, Any]:
-        sess = self._ensure_tmux_session(session)
-        out = self._tmux(["display-message", "-p", "-t", sess, "#{pane_current_path}"]).strip()
-        return {"cwd": out}
+    def tmux_log_purge(self) -> Dict[str, Any]:
+        log_path = self._get_log_path()
+        try:
+            os.truncate(log_path, 0)
+        except OSError as e:
+            raise MCPError(f"failed to purge log: {e}")
+        self._log_offsets[log_path] = 0
+        return {"ok": True, "purged": log_path}
 
 
 TOOLS = [
@@ -954,6 +945,14 @@ TOOLS = [
         },
     },
     {
+        "name": "tmux_log_purge",
+        "description": "Purge the tmux log file entirely. Use when the log contains sensitive data (secrets, credentials) that should be deleted.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
         "name": "ssh_exec",
         "description": "Run a non-interactive command over SSH (no tmux) and return output.",
         "inputSchema": {
@@ -970,7 +969,12 @@ TMUX_ONLY_TOOLS = [
 ]
 
 
-def handle_call(client: SSHClient, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+SSH_ONLY_TOOLS = {"sftp_list", "sftp_read", "sftp_write", "sftp_patch", "sftp_stat", "sftp_mkdir", "sftp_rm", "sftp_rename", "ssh_exec"}
+
+
+def handle_call(client: Union[SSHClient, LocalClient], name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    if isinstance(client, LocalClient) and name in SSH_ONLY_TOOLS:
+        raise MCPError(f"tool not available in local mode: {name}")
     if name == "sftp_list":
         return client.list_dir(args["path"])
     if name == "sftp_read":
@@ -1022,6 +1026,8 @@ def handle_call(client: SSHClient, name: str, args: Dict[str, Any]) -> Dict[str,
         )
     if name == "tmux_cwd":
         return client.tmux_cwd(args.get("session"))
+    if name == "tmux_log_purge":
+        return client.tmux_log_purge()
     if name == "ssh_exec":
         return client.ssh_exec(args["command"])
     raise MCPError(f"Unknown tool: {name}")
@@ -1035,12 +1041,14 @@ def main() -> None:
     parser.add_argument("--root", default=None, help="optional root path restriction")
     parser.add_argument("--local", action="store_true", help="run in local tmux-only mode")
     parser.add_argument("--log-path", default=None, help="log path for local tmux capture")
+    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help=f"SSH/command timeout in seconds (default: {DEFAULT_TIMEOUT})")
+    parser.add_argument("--max-log-size", type=int, default=DEFAULT_MAX_LOG_BYTES, help=f"max tmux log size in bytes before truncation (default: {DEFAULT_MAX_LOG_BYTES})")
     args = parser.parse_args()
 
     _log(
         "starting server with args: "
         f"host={args.host} socket={args.socket} tmux={args.tmux_session} root={args.root} "
-        f"local={args.local} log_path={args.log_path}"
+        f"local={args.local} log_path={args.log_path} timeout={args.timeout}"
     )
     host = args.host
     tmux_session = args.tmux_session
@@ -1052,7 +1060,7 @@ def main() -> None:
 
     _log(f"resolved session: host={host} tmux={tmux_session}")
     if args.local:
-        client = LocalClient(tmux_session, args.log_path)
+        client = LocalClient(tmux_session, args.log_path, timeout=args.timeout, max_log_bytes=args.max_log_size)
         tools = TMUX_ONLY_TOOLS
         # Ensure local tmux session exists and pipe-pane is enabled.
         code, _out, _err = _run_cmd(["tmux", "has-session", "-t", tmux_session])
@@ -1062,9 +1070,19 @@ def main() -> None:
         with open(client.log_path, "a", encoding="utf-8"):
             pass
         _run_cmd(["tmux", "pipe-pane", "-o", "-t", tmux_session, f"cat >> {client.log_path}"])
+        # Truncate log on startup if oversized
+        try:
+            size = os.path.getsize(client.log_path)
+            if size > args.max_log_size:
+                _log(f"startup: log {client.log_path} is {size} bytes, truncating")
+                with open(client.log_path, "w"):
+                    pass
+        except OSError:
+            pass
     else:
-        client = SSHClient(host, args.socket, args.root, tmux_session)
+        client = SSHClient(host, args.socket, args.root, tmux_session, timeout=args.timeout, max_log_bytes=args.max_log_size)
         tools = TOOLS
+        # Avoid SSH calls on startup so initialize can complete quickly.
 
     while True:
         try:

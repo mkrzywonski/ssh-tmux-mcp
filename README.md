@@ -77,6 +77,7 @@ args = ["/home/mike/ai/ssh-tmux-mcp/mcp_server.py", "--local", "--tmux-session",
 - `sftp_read`/`sftp_write` use base64 to be binary-safe.
 - `sftp_patch` applies unified diffs locally, then writes back; it does not require `patch` on the remote.
 - If you want to restrict access, pass `--root /path` to constrain file ops.
+- Tmux log output is capped to `--max-log-size` bytes; older output is truncated to keep the last N bytes.
 
 ## Workflow Recommendations
 
