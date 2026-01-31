@@ -134,14 +134,11 @@ Tracked improvements for ssh-tmux-mcp, ordered by priority.
 
 ## Issue 10: ai-ssh cleanup tears down ControlMaster on normal detach
 
-**Status:** Pending
+**Status:** Not planned
 
 **Description:** `cleanup` runs unconditionally at the end of `ai-ssh`, which kills the ControlMaster after detaching from tmux. This means the MCP server loses its SSH connection whenever the user detaches.
 
-**Plan:**
-- Only run cleanup on `--kill`, errors, or signals — not on normal tmux detach.
-- After `tmux attach` exits normally, print a message that the session is still active and how to kill it (`ai-ssh --kill`).
-- Keep signal traps for INT/TERM so Ctrl-C still cleans up.
+**Decision:** Keep current behavior. Exiting tmux should tear down the ControlMaster and session cleanly.
 
 ---
 
