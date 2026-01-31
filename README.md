@@ -38,6 +38,19 @@ When you exit the tmux session, the ControlMaster is closed automatically.
 Helper:
 - `./tmux-capture-recent [lines]` prints the last N lines from the shared tmux session.
 
+## Local mode (tmux-only)
+
+If you want the same collaborative tmux workflow locally (no SSH), run the server
+with `--local`. It will create the tmux session if missing and enable a log pipe.
+
+Example config:
+
+```toml
+[mcp_servers.tmux_local]
+command = "python3"
+args = ["/home/mike/ai/ssh-tmux-mcp/mcp_server.py", "--local", "--tmux-session", "shared-ai"]
+```
+
 ## Tools
 
 - `sftp_list` { path }

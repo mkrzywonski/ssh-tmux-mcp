@@ -599,6 +599,185 @@ class SSHClient:
         return {"content": out}
 
 
+class LocalClient:
+    def __init__(self, tmux_session: Optional[str], log_path: Optional[str]) -> None:
+        self.tmux_session = tmux_session or "shared-ai"
+        self.log_path = log_path or "/tmp/ai-ssh/tmux.log"
+        self._log_offsets: Dict[str, int] = {}
+
+    def _run_local(self, cmd: List[str]) -> Tuple[int, str, str]:
+        return _run_cmd(cmd)
+
+    def _ensure_tmux_session(self, session: Optional[str]) -> str:
+        return session or self.tmux_session
+
+    def _read_stream_from_offset(self, log_path: str, offset: int, max_bytes: int) -> Dict[str, Any]:
+        try:
+            size = os.path.getsize(log_path)
+        except FileNotFoundError:
+            return {"content": "", "offset": 0, "size": 0, "truncated": False}
+        if size < offset:
+            offset = 0
+        to_read = min(max_bytes, max(0, size - offset))
+        if to_read == 0:
+            return {"content": "", "offset": offset, "size": size, "truncated": False}
+        with open(log_path, "rb") as handle:
+            handle.seek(offset)
+            chunk = handle.read(to_read)
+        return {
+            "content": chunk.decode("utf-8", errors="replace"),
+            "offset": offset + to_read,
+            "size": size,
+            "truncated": (size - offset) > max_bytes,
+        }
+
+    def _tmux(self, args: List[str]) -> str:
+        code, out, err = self._run_local(["tmux"] + args)
+        if code != 0:
+            raise MCPError(err.strip() or "tmux command failed")
+        return out
+
+    def tmux_capture(self, session: Optional[str], lines: Optional[int]) -> Dict[str, Any]:
+        sess = self._ensure_tmux_session(session)
+        target = ["capture-pane", "-p", "-t", sess]
+        if lines is not None:
+            target.extend(["-S", f"-{int(lines)}"])
+        out = self._tmux(target)
+        return {"content": out}
+
+    def tmux_capture_scrollback(self, session: Optional[str], max_lines: Optional[int]) -> Dict[str, Any]:
+        sess = self._ensure_tmux_session(session)
+        target = ["capture-pane", "-p", "-t", sess, "-S"]
+        target.append(f"-{int(max_lines)}" if max_lines is not None else "-")
+        out = self._tmux(target)
+        return {"content": out}
+
+    def tmux_send(self, session: Optional[str], keys: str, enter: bool) -> Dict[str, Any]:
+        sess = self._ensure_tmux_session(session)
+        self._tmux(["send-keys", "-t", sess, "--", keys])
+        if enter:
+            self._tmux(["send-keys", "-t", sess, "C-m"])
+        return {"ok": True}
+
+    def tmux_run(self, session: Optional[str], command: str, lines: int, delay_ms: int) -> Dict[str, Any]:
+        sess = self._ensure_tmux_session(session)
+        self._tmux(["send-keys", "-t", sess, "--", command])
+        self._tmux(["send-keys", "-t", sess, "C-m"])
+        if delay_ms > 0:
+            time.sleep(delay_ms / 1000.0)
+        out = self._tmux(["capture-pane", "-p", "-t", sess, "-S", f"-{int(lines)}"])
+        return {"content": out}
+
+    def tmux_stream_read(self, session: Optional[str], max_bytes: int, reset: bool) -> Dict[str, Any]:
+        _ = self._ensure_tmux_session(session)
+        offset = 0 if reset else self._log_offsets.get(self.log_path, 0)
+        result = self._read_stream_from_offset(self.log_path, offset, max_bytes)
+        self._log_offsets[self.log_path] = result["offset"]
+        return result
+
+    def tmux_run_stream(self, session: Optional[str], command: str, max_bytes: int, delay_ms: int) -> Dict[str, Any]:
+        sess = self._ensure_tmux_session(session)
+        start = self._read_stream_from_offset(self.log_path, 0, 0)["size"]
+        self._tmux(["send-keys", "-t", sess, "--", command])
+        self._tmux(["send-keys", "-t", sess, "C-m"])
+        if delay_ms > 0:
+            time.sleep(delay_ms / 1000.0)
+        result = self._read_stream_from_offset(self.log_path, start, max_bytes)
+        self._log_offsets[self.log_path] = result["offset"]
+        return result
+
+    def tmux_run_sentinel(
+        self,
+        session: Optional[str],
+        command: str,
+        max_bytes: int,
+        delay_ms: int,
+        timeout_ms: int,
+        poll_ms: int,
+    ) -> Dict[str, Any]:
+        sess = self._ensure_tmux_session(session)
+        token = f"__AI_SENTINEL__{os.getpid()}_{int(time.time())}_{os.urandom(6).hex()}"
+        sentinel = f"{token}:"
+        marker_cmd = f"printf '\\n{token}:%s\\n' \"$?\""
+
+        start = self._read_stream_from_offset(self.log_path, 0, 0)["size"]
+        self._tmux(["send-keys", "-t", sess, "--", command])
+        self._tmux(["send-keys", "-t", sess, "C-m"])
+        self._tmux(["send-keys", "-t", sess, "--", marker_cmd])
+        self._tmux(["send-keys", "-t", sess, "C-m"])
+        if delay_ms > 0:
+            time.sleep(delay_ms / 1000.0)
+
+        deadline = time.time() + max(0, timeout_ms) / 1000.0
+        offset = start
+        content = ""
+        exit_code: Optional[int] = None
+        truncated = False
+
+        def _find_sentinel_line(data: str) -> Optional[Tuple[int, int, int]]:
+            if data.startswith(sentinel):
+                line_end = data.find("\n", 0)
+                if line_end == -1:
+                    return None
+                code_str = data[len(sentinel):line_end].strip().strip("\r")
+                return (0, line_end, int(code_str)) if code_str.isdigit() else None
+            for needle, start_offset in (("\r\n", 2), ("\n", 1), ("\r", 1)):
+                idx = data.find(f"{needle}{sentinel}")
+                if idx == -1:
+                    continue
+                line_start = idx + start_offset
+                line_end = data.find("\n", line_start)
+                if line_end == -1:
+                    return None
+                code_str = data[line_start + len(sentinel):line_end].strip().strip("\r")
+                if not code_str.isdigit():
+                    return None
+                return (idx, line_end, int(code_str))
+            return None
+
+        while True:
+            remaining = max_bytes - len(content)
+            if remaining <= 0:
+                truncated = True
+                break
+            result = self._read_stream_from_offset(self.log_path, offset, min(remaining, 8192))
+            offset = result["offset"]
+            if result["content"]:
+                content += result["content"]
+                found = _find_sentinel_line(content)
+                if found is not None:
+                    cut_idx, _line_end, exit_code = found
+                    content = content[:cut_idx]
+                    break
+            if timeout_ms <= 0:
+                break
+            if time.time() >= deadline:
+                break
+            time.sleep(max(0, poll_ms) / 1000.0)
+
+        if content:
+            cleaned_lines = []
+            for line in content.splitlines():
+                if token in line and "printf" in line:
+                    continue
+                cleaned_lines.append(line)
+            content = "\n".join(cleaned_lines)
+
+        self._log_offsets[self.log_path] = offset
+        return {
+            "content": content,
+            "exit_code": exit_code,
+            "timed_out": timeout_ms > 0 and time.time() >= deadline and exit_code is None,
+            "truncated": truncated,
+            "sentinel": token,
+        }
+
+    def tmux_cwd(self, session: Optional[str]) -> Dict[str, Any]:
+        sess = self._ensure_tmux_session(session)
+        out = self._tmux(["display-message", "-p", "-t", sess, "#{pane_current_path}"]).strip()
+        return {"cwd": out}
+
+
 TOOLS = [
     {
         "name": "sftp_list",
@@ -785,6 +964,11 @@ TOOLS = [
     },
 ]
 
+TMUX_ONLY_TOOLS = [
+    tool for tool in TOOLS
+    if tool["name"].startswith("tmux_")
+]
+
 
 def handle_call(client: SSHClient, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     if name == "sftp_list":
@@ -846,19 +1030,41 @@ def handle_call(client: SSHClient, name: str, args: Dict[str, Any]) -> Dict[str,
 def main() -> None:
     parser = argparse.ArgumentParser(description="SSH/tmux MCP server (stdio).")
     parser.add_argument("--host", default=None, help="user@host for SSH (optional if socket info exists)")
-    parser.add_argument("--socket", required=True, help="path to SSH control socket")
+    parser.add_argument("--socket", default=None, help="path to SSH control socket")
     parser.add_argument("--tmux-session", default=None, help="tmux session name")
     parser.add_argument("--root", default=None, help="optional root path restriction")
+    parser.add_argument("--local", action="store_true", help="run in local tmux-only mode")
+    parser.add_argument("--log-path", default=None, help="log path for local tmux capture")
     args = parser.parse_args()
 
-    _log(f"starting server with args: host={args.host} socket={args.socket} tmux={args.tmux_session} root={args.root}")
+    _log(
+        "starting server with args: "
+        f"host={args.host} socket={args.socket} tmux={args.tmux_session} root={args.root} "
+        f"local={args.local} log_path={args.log_path}"
+    )
     host = args.host
     tmux_session = args.tmux_session
     if tmux_session is None:
         tmux_session = "shared-ai"
 
+    if not args.local and not args.socket:
+        raise SystemExit("--socket is required unless --local is set")
+
     _log(f"resolved session: host={host} tmux={tmux_session}")
-    client = SSHClient(host, args.socket, args.root, tmux_session)
+    if args.local:
+        client = LocalClient(tmux_session, args.log_path)
+        tools = TMUX_ONLY_TOOLS
+        # Ensure local tmux session exists and pipe-pane is enabled.
+        code, _out, _err = _run_cmd(["tmux", "has-session", "-t", tmux_session])
+        if code != 0:
+            _run_cmd(["tmux", "new-session", "-d", "-s", tmux_session])
+        os.makedirs(os.path.dirname(client.log_path), exist_ok=True)
+        with open(client.log_path, "a", encoding="utf-8"):
+            pass
+        _run_cmd(["tmux", "pipe-pane", "-o", "-t", tmux_session, f"cat >> {client.log_path}"])
+    else:
+        client = SSHClient(host, args.socket, args.root, tmux_session)
+        tools = TOOLS
 
     while True:
         try:
@@ -887,7 +1093,7 @@ def main() -> None:
             continue
 
         if method in ("listTools", "tools/list"):
-            send_message({"jsonrpc": "2.0", "id": msg_id, "result": {"tools": TOOLS}})
+            send_message({"jsonrpc": "2.0", "id": msg_id, "result": {"tools": tools}})
             continue
 
         if method in ("callTool", "tools/call"):
