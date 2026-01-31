@@ -1155,7 +1155,11 @@ def main() -> None:
             send_message({"jsonrpc": "2.0", "id": msg_id, "result": None})
             break
 
-        # Notifications like "initialized" can be ignored
+        if method in ("notifications/initialized", "initialized"):
+            _log("received initialized notification")
+            continue
+
+        # Other notifications can be ignored
 
 
 if __name__ == "__main__":
