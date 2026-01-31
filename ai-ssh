@@ -110,7 +110,10 @@ if ! "${ssh_cmd[@]}" -S "$socket" "$host" tmux has-session -t "$tmux_name" >/dev
 fi
 
 "${ssh_cmd[@]}" -S "$socket" "$host" "mkdir -p /tmp/ai-ssh && : > $remote_log_path" >/dev/null 2>&1 || true
-"${ssh_cmd[@]}" -S "$socket" "$host" "tmux pipe-pane -o -t $tmux_name 'cat >> $remote_log_path'" >/dev/null 2>&1 || true
+pane_id="$("${ssh_cmd[@]}" -S "$socket" "$host" "tmux list-panes -t $tmux_name -F '#{pane_id}' | head -n1" 2>/dev/null || true)"
+if [[ -n "$pane_id" ]]; then
+  "${ssh_cmd[@]}" -S "$socket" "$host" "tmux pipe-pane -t $pane_id 'cat >> $remote_log_path'" >/dev/null 2>&1 || true
+fi
 
 echo "Attaching to tmux session '$tmux_name'..."
 if ! "${ssh_cmd[@]}" -t -S "$socket" "$host" tmux attach -t "$tmux_name"; then
