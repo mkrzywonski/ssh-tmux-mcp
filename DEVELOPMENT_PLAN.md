@@ -156,11 +156,10 @@ Tracked improvements for ssh-tmux-mcp, ordered by priority.
 
 ## Issue 12: Protocol version is pinned
 
-**Status:** Pending
+**Status:** Done
 
 **Description:** The server always responds with `protocolVersion: "2024-11-05"` regardless of what the client requests. As the MCP spec evolves, this could cause compatibility issues.
 
-**Plan:**
-- Read the client's requested `protocolVersion` from the `initialize` params.
-- Respond with the minimum of the client's requested version and the server's supported version.
-- For now, keep `2024-11-05` as the maximum supported version and update as needed.
+**Changes:**
+- Added protocol negotiation that clamps to the server's supported version.
+- Invalid or missing client versions fall back to the server version.

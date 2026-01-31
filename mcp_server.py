@@ -17,6 +17,7 @@ MAX_WRITE_B64 = 15 * 1024 * 1024
 MAX_PATCH_BYTES = 1 * 1024 * 1024
 DEFAULT_TIMEOUT = 30
 DEFAULT_MAX_LOG_BYTES = 25 * 1024 * 1024
+SERVER_PROTOCOL_VERSION = "2024-11-05"
 DEBUG = os.getenv("SSH_TMUX_MCP_DEBUG", "0") not in ("0", "", "false", "False")
 FRAMING = "lsp"
 
@@ -48,6 +49,16 @@ def _read_exact(n: int) -> bytes:
             break
         data += chunk
     return data
+
+
+def _negotiate_protocol(requested: Optional[str]) -> str:
+    if not requested:
+        return SERVER_PROTOCOL_VERSION
+    if not (len(requested) == 10 and requested[4] == "-" and requested[7] == "-"):
+        return SERVER_PROTOCOL_VERSION
+    if not requested.replace("-", "").isdigit():
+        return SERVER_PROTOCOL_VERSION
+    return min(requested, SERVER_PROTOCOL_VERSION)
 
 
 def read_message() -> Optional[Dict[str, Any]]:
@@ -1102,8 +1113,10 @@ def main() -> None:
         _log(f"dispatch method={method} id={msg_id}")
 
         if method == "initialize":
+            params = msg.get("params", {}) if isinstance(msg.get("params", {}), dict) else {}
+            negotiated = _negotiate_protocol(params.get("protocolVersion"))
             result = {
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": negotiated,
                 "serverInfo": {"name": "ssh-tmux-mcp", "version": "0.1.0"},
                 "capabilities": {"tools": {}},
             }
