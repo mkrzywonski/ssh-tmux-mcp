@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage: ai-ssh [options] user@host
+
+Establishes an SSH ControlMaster connection and ensures a tmux session exists.
+
+Options:
+  -r, --restart   Close any existing session and start a new one
+  -k, --kill      Close any existing session and exit
+USAGE
+}
+
+restart=0
+kill_only=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -r|--restart)
+      restart=1; shift;;
+    -k|--kill)
+      kill_only=1; shift;;
+    -h|--help)
+      usage; exit 0;;
+    --)
+      shift; break;;
+    -*)
+      echo "Unknown option: $1" >&2; usage; exit 2;;
+    *)
+      break;;
+  esac
+done
+
+if [[ $# -ne 1 ]]; then
+  usage
+  exit 2
+fi
+
+host="$1"
+run_dir="/run/user/$UID/ai-ssh"
+socket="$run_dir/ssh-remote.sock"
+info_file="$socket.info"
+tmux_name="shared-ai"
+remote_log_path="/tmp/ai-ssh/tmux.log"
+ssh_cmd=(ssh -A)
+
+cleanup() {
+  "${ssh_cmd[@]}" -S "$socket" -O exit "$host" >/dev/null 2>&1 || true
+  rm -f "$socket" "$info_file"
+}
+
+fail() {
+  echo "Error: $1" >&2
+  cleanup
+  exit 1
+}
+
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+
+mkdir -p "$run_dir"
+
+if [[ -S "$socket" ]]; then
+  if "${ssh_cmd[@]}" -S "$socket" -O check "$host" >/dev/null 2>&1; then
+    if [[ $kill_only -eq 1 || $restart -eq 1 ]]; then
+      "${ssh_cmd[@]}" -S "$socket" -O exit "$host" >/dev/null 2>&1 || true
+      rm -f "$socket" "$info_file"
+      if [[ $kill_only -eq 1 && $restart -eq 0 ]]; then
+        exit 0
+      fi
+    else
+      echo "Error: session already exists on socket $socket" >&2
+      echo "Use --restart to replace it." >&2
+      exit 1
+    fi
+  else
+    rm -f "$socket" "$info_file"
+  fi
+fi
+
+echo "Opening SSH ControlMaster for $host..."
+if [[ ! -S "$socket" ]]; then
+  if ! "${ssh_cmd[@]}" -M -S "$socket" -fN "$host"; then
+    fail "failed to start SSH ControlMaster"
+  fi
+fi
+
+check_out="$("${ssh_cmd[@]}" -S "$socket" -O check "$host" 2>&1 || true)"
+if ! "${ssh_cmd[@]}" -S "$socket" -O check "$host" >/dev/null 2>&1; then
+  fail "SSH ControlMaster not responding"
+fi
+
+pid="$(printf '%s' "$check_out" | sed -n 's/.*pid=\\([0-9][0-9]*\\).*/\\1/p')"
+
+cat <<INFO > "$info_file"
+host=$host
+socket=$socket
+tmux=$tmux_name
+log_path=$remote_log_path
+pid=$pid
+INFO
+
+echo "Ensuring tmux session '$tmux_name' exists..."
+if ! "${ssh_cmd[@]}" -S "$socket" "$host" tmux has-session -t "$tmux_name" >/dev/null 2>&1; then
+  if ! "${ssh_cmd[@]}" -S "$socket" "$host" tmux new-session -d -s "$tmux_name"; then
+    fail "failed to create tmux session"
+  fi
+fi
+
+"${ssh_cmd[@]}" -S "$socket" "$host" "mkdir -p /tmp/ai-ssh && : > $remote_log_path" >/dev/null 2>&1 || true
+"${ssh_cmd[@]}" -S "$socket" "$host" "tmux pipe-pane -o -t $tmux_name 'cat >> $remote_log_path'" >/dev/null 2>&1 || true
+
+echo "Attaching to tmux session '$tmux_name'..."
+if ! "${ssh_cmd[@]}" -t -S "$socket" "$host" tmux attach -t "$tmux_name"; then
+  fail "failed to attach tmux session"
+fi
+
+cleanup

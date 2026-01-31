@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage: tmux-capture-recent [lines]
+
+Print the last N lines from the shared tmux session (default: 500).
+USAGE
+}
+
+lines="${1:-500}"
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+run_dir="/run/user/$UID/ai-ssh"
+socket="$run_dir/ssh-remote.sock"
+info_file="$socket.info"
+
+if [[ ! -f "$info_file" ]]; then
+  echo "Error: session info not found at $info_file" >&2
+  exit 1
+fi
+
+host=""
+tmux_name=""
+while IFS='=' read -r key value; do
+  case "$key" in
+    host) host="$value";;
+    tmux) tmux_name="$value";;
+  esac
+done < "$info_file"
+
+if [[ -z "$host" || -z "$tmux_name" ]]; then
+  echo "Error: incomplete session info in $info_file" >&2
+  exit 1
+fi
+
+ssh -S "$socket" "$host" tmux capture-pane -p -t "$tmux_name" -S "-${lines}"
