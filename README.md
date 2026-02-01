@@ -63,11 +63,9 @@ args = ["/home/mike/ai/ssh-tmux-mcp/mcp_server.py", "--local", "--tmux-session",
 - `sftp_rename` { src, dst }
 - `tmux_capture` { session?, lines? }
 - `tmux_capture_scrollback` { session?, max_lines? }
-- `tmux_send` { session?, keys, enter? }
-- `tmux_run` { session?, command, lines?, delay_ms? } -> recent output
+- `tmux_send` { session?, keys, enter? } — for interactive use; prefer `tmux_run` for commands
+- `tmux_run` { session?, command, timeout_ms? } -> output + exit code (blocks until done)
 - `tmux_stream_read` { session?, max_bytes?, reset? } -> new output since last read
-- `tmux_run_stream` { session?, command, max_bytes?, delay_ms? } -> new output from log
-- `tmux_run_sentinel` { session?, command, max_bytes?, delay_ms?, timeout_ms?, poll_ms? } -> output up to sentinel + exit code
 - `tmux_cwd` { session? }
 - `ssh_exec` { command } -> output (non-interactive, no tmux)
 
@@ -78,9 +76,10 @@ args = ["/home/mike/ai/ssh-tmux-mcp/mcp_server.py", "--local", "--tmux-session",
 - `sftp_patch` applies unified diffs locally, then writes back; it does not require `patch` on the remote.
 - If you want to restrict access, pass `--root /path` to constrain file ops.
 - Tmux log output is capped to `--max-log-size` bytes; older output is truncated to keep the last N bytes.
+- `tmux_run` uses a PS1 prompt marker to detect command completion. On first call it exports a custom PS1 into the shell. The `--prompt-timeout-ms` flag controls the default timeout (30s).
 
 ## Workflow Recommendations
 
 - Prefer `sftp_*` tools for file edits (read/modify/write) to avoid shell quoting issues.
-- Use tmux tools for commands, build output, and interactive steps (sudo prompts, long-running tasks).
+- Use `tmux_run` for commands — it blocks until completion and returns the exit code. For interactive commands (vim, sudo prompts), use `tmux_send` + `tmux_capture`.
 - Use `ssh_exec` for quick, non-interactive commands when you don't need shared tmux visibility.

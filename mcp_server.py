@@ -4,6 +4,7 @@ import base64
 import json
 import os
 import posixpath
+import re
 import shlex
 import subprocess
 import sys
@@ -20,6 +21,12 @@ DEFAULT_MAX_LOG_BYTES = 25 * 1024 * 1024
 SERVER_PROTOCOL_VERSION = "2024-11-05"
 DEBUG = os.getenv("SSH_TMUX_MCP_DEBUG", "0") not in ("0", "", "false", "False")
 FRAMING = "lsp"
+
+_ANSI_RE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07|\x1b[()][AB012]|\x1b\[\?[0-9;]*[hlm]')
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub('', text)
 
 
 def _log(message: str) -> None:
@@ -238,32 +245,6 @@ def _apply_unified_diff(original_text: str, patch_text: str) -> str:
     return "".join(out_lines)
 
 
-def _find_sentinel_line(sentinel: str, data: str) -> Optional[Tuple[int, int, int]]:
-    """Search for a sentinel marker line in captured output.
-
-    Returns (cut_index, line_end, exit_code) or None.
-    """
-    if data.startswith(sentinel):
-        line_end = data.find("\n", 0)
-        if line_end == -1:
-            return None
-        code_str = data[len(sentinel):line_end].strip().strip("\r")
-        return (0, line_end, int(code_str)) if code_str.isdigit() else None
-    for needle, start_offset in (("\r\n", 2), ("\n", 1), ("\r", 1)):
-        idx = data.find(f"{needle}{sentinel}")
-        if idx == -1:
-            continue
-        line_start = idx + start_offset
-        line_end = data.find("\n", line_start)
-        if line_end == -1:
-            return None
-        code_str = data[line_start + len(sentinel):line_end].strip().strip("\r")
-        if not code_str.isdigit():
-            return None
-        return (idx, line_end, int(code_str))
-    return None
-
-
 class TmuxClientBase:
     """Shared tmux session logic for both SSH and local modes.
 
@@ -274,9 +255,14 @@ class TmuxClientBase:
       _ensure_tmux_session(session) -> str
     """
 
-    def __init__(self, max_log_bytes: int = DEFAULT_MAX_LOG_BYTES) -> None:
+    def __init__(self, max_log_bytes: int = DEFAULT_MAX_LOG_BYTES, prompt_timeout_ms: int = 30000) -> None:
         self._log_offsets: Dict[str, int] = {}
         self.max_log_bytes = max_log_bytes
+        self._prompt_token = os.urandom(4).hex()
+        self._prompt_marker = f"__AISESS_{self._prompt_token}_"
+        self._prompt_re = re.compile(r"__AISESS_" + self._prompt_token + r"_(\d+)__")
+        self._prompt_initialized = False
+        self.prompt_timeout_ms = prompt_timeout_ms
 
     def _run_tmux(self, tmux_shell_cmd: str) -> str:
         raise NotImplementedError
@@ -298,10 +284,112 @@ class TmuxClientBase:
         """Purge the tmux log file entirely (e.g. to remove sensitive output)."""
         raise NotImplementedError
 
-    def _send_keys_with_sentinel(self, quoted_session: str, key_arg: str, marker_cmd: str) -> None:
-        """Send command + sentinel marker to tmux. SSH subclass combines into one call."""
-        self._run_tmux(f"tmux send-keys -t {quoted_session} -- {key_arg} C-m")
-        self._run_tmux(f"tmux send-keys -t {quoted_session} -- {marker_cmd} C-m")
+    def _initialize_prompt(self, quoted_session: str) -> None:
+        """Export a custom PS1 containing our session token. Called once per session."""
+        ps1 = f"__AISESS_{self._prompt_token}_$?__ \\\\$ "
+        export_cmd = shlex.quote(f"export PS1='{ps1}'")
+        self._run_tmux(f"tmux send-keys -t {quoted_session} -- {export_cmd} C-m")
+        # Poll capture-pane until marker appears (up to 5s)
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            time.sleep(0.1)
+            out = self._run_tmux(f"tmux capture-pane -p -t {quoted_session}")
+            for line in reversed(out.splitlines()):
+                line = line.strip()
+                if line and self._prompt_re.search(line):
+                    self._prompt_initialized = True
+                    return
+        raise MCPError("Failed to initialize PS1 prompt marker (timed out)")
+
+    def _check_shell_ready(self, quoted_session: str) -> bool:
+        """Check if the last non-empty line in the pane matches our prompt marker."""
+        out = self._run_tmux(f"tmux capture-pane -p -t {quoted_session}")
+        for line in reversed(out.splitlines()):
+            line = line.strip()
+            if line:
+                return bool(self._prompt_re.search(line))
+        return False
+
+    def _wait_for_shell_ready(self, quoted_session: str, timeout_ms: int) -> Tuple[bool, str]:
+        """Wait for shell prompt to appear. Returns (ready, pane_content)."""
+        if self._check_shell_ready(quoted_session):
+            return True, ""
+        # Send Enter to trigger a fresh prompt
+        self._run_tmux(f"tmux send-keys -t {quoted_session} '' C-m")
+        time.sleep(0.2)
+        deadline = time.time() + timeout_ms / 1000.0
+        while time.time() < deadline:
+            out = self._run_tmux(f"tmux capture-pane -p -t {quoted_session}")
+            for line in reversed(out.splitlines()):
+                line = line.strip()
+                if line:
+                    if self._prompt_re.search(line):
+                        return True, out
+                    break
+            time.sleep(0.1)
+        out = self._run_tmux(f"tmux capture-pane -p -t {quoted_session}")
+        return False, out
+
+    def _poll_log_for_marker(self, log_path: str, offset: int, timeout_ms: int, max_bytes: int) -> Dict[str, Any]:
+        """Poll the log file from offset until our prompt marker appears."""
+        deadline = time.time() + timeout_ms / 1000.0
+        content = ""
+        current_offset = offset
+        last_size = offset
+        timed_out = False
+
+        while True:
+            remaining = max_bytes - len(content)
+            if remaining <= 0:
+                break
+            result = self._read_stream_from_offset(log_path, current_offset, min(remaining, 8192))
+            current_offset = result["offset"]
+            last_size = result.get("size", last_size)
+            if result["content"]:
+                content += result["content"]
+                match = self._prompt_re.search(content)
+                if match:
+                    # Found marker — extract exit code, truncate content at marker line
+                    exit_code = int(match.group(1))
+                    # Cut everything from the marker line onward
+                    marker_line_start = content.rfind("\n", 0, match.start())
+                    if marker_line_start == -1:
+                        cut_content = ""
+                    else:
+                        cut_content = content[:marker_line_start]
+                    # Clean up
+                    cut_content = _strip_ansi(cut_content)
+                    cleaned_lines = [
+                        line for line in cut_content.splitlines()
+                        if self._prompt_marker not in line
+                    ]
+                    self._log_offsets[log_path] = current_offset
+                    if last_size > self.max_log_bytes:
+                        self._truncate_log_if_needed(log_path)
+                    return {
+                        "content": "\n".join(cleaned_lines).strip(),
+                        "exit_code": exit_code,
+                        "timed_out": False,
+                    }
+            if time.time() >= deadline:
+                timed_out = True
+                break
+            time.sleep(0.1)
+
+        # Timed out — return what we have
+        content = _strip_ansi(content)
+        cleaned_lines = [
+            line for line in content.splitlines()
+            if self._prompt_marker not in line
+        ]
+        self._log_offsets[log_path] = current_offset
+        if last_size > self.max_log_bytes:
+            self._truncate_log_if_needed(log_path)
+        return {
+            "content": "\n".join(cleaned_lines).strip(),
+            "exit_code": None,
+            "timed_out": timed_out,
+        }
 
     def tmux_capture(self, session: Optional[str], lines: Optional[int]) -> Dict[str, Any]:
         sess = self._ensure_tmux_session(session)
@@ -331,15 +419,28 @@ class TmuxClientBase:
             self._run_tmux(f"tmux send-keys -t {quoted} -- {key_arg}")
         return {"ok": True}
 
-    def tmux_run(self, session: Optional[str], command: str, lines: int, delay_ms: int) -> Dict[str, Any]:
+    def tmux_run(self, session: Optional[str], command: str, timeout_ms: Optional[int] = None) -> Dict[str, Any]:
         sess = self._ensure_tmux_session(session)
         quoted = shlex.quote(sess)
         key_arg = shlex.quote(command)
+        timeout = timeout_ms or self.prompt_timeout_ms
+
+        if not self._prompt_initialized:
+            self._initialize_prompt(quoted)
+
+        # Pre-check: wait for shell to be ready
+        ready, pane = self._wait_for_shell_ready(quoted, timeout)
+        if not ready:
+            raise MCPError(f"Shell not ready (no prompt detected). Pane:\n{pane[-500:]}")
+
+        # Record log offset, send command
+        log_path = self._get_log_path()
+        start = self._read_stream_from_offset(log_path, 0, 0)["size"]
         self._run_tmux(f"tmux send-keys -t {quoted} -- {key_arg} C-m")
-        if delay_ms > 0:
-            time.sleep(delay_ms / 1000.0)
-        out = self._run_tmux(f"tmux capture-pane -p -t {quoted} -S -{int(lines)}")
-        return {"content": out}
+
+        # Wait for completion
+        result = self._poll_log_for_marker(log_path, start, timeout, max_bytes=65536)
+        return result
 
     def tmux_stream_read(self, session: Optional[str], max_bytes: int, reset: bool) -> Dict[str, Any]:
         self._ensure_tmux_session(session)
@@ -351,90 +452,6 @@ class TmuxClientBase:
             self._truncate_log_if_needed(log_path)
         return result
 
-    def tmux_run_stream(self, session: Optional[str], command: str, max_bytes: int, delay_ms: int) -> Dict[str, Any]:
-        sess = self._ensure_tmux_session(session)
-        log_path = self._get_log_path()
-        quoted = shlex.quote(sess)
-        key_arg = shlex.quote(command)
-        start = self._read_stream_from_offset(log_path, 0, 0)["size"]
-        self._run_tmux(f"tmux send-keys -t {quoted} -- {key_arg} C-m")
-        if delay_ms > 0:
-            time.sleep(delay_ms / 1000.0)
-        result = self._read_stream_from_offset(log_path, start, max_bytes)
-        self._log_offsets[log_path] = result["offset"]
-        if result.get("size", 0) > self.max_log_bytes:
-            self._truncate_log_if_needed(log_path)
-        return result
-
-    def tmux_run_sentinel(
-        self,
-        session: Optional[str],
-        command: str,
-        max_bytes: int,
-        delay_ms: int,
-        timeout_ms: int,
-        poll_ms: int,
-    ) -> Dict[str, Any]:
-        sess = self._ensure_tmux_session(session)
-        log_path = self._get_log_path()
-        quoted = shlex.quote(sess)
-        key_arg = shlex.quote(command)
-        token = f"__AI_SENTINEL__{os.getpid()}_{int(time.time())}_{os.urandom(6).hex()}"
-        sentinel = f"{token}:"
-        marker_cmd = shlex.quote(f"printf '\\n{token}:%s\\n' \"$?\"")
-
-        start = self._read_stream_from_offset(log_path, 0, 0)["size"]
-        self._send_keys_with_sentinel(quoted, key_arg, marker_cmd)
-        if delay_ms > 0:
-            time.sleep(delay_ms / 1000.0)
-
-        deadline = time.time() + max(0, timeout_ms) / 1000.0
-        offset = start
-        content = ""
-        exit_code: Optional[int] = None
-        truncated = False
-        last_size = start
-
-        while True:
-            remaining = max_bytes - len(content)
-            if remaining <= 0:
-                truncated = True
-                break
-            result = self._read_stream_from_offset(log_path, offset, min(remaining, 8192))
-            offset = result["offset"]
-            last_size = result.get("size", last_size)
-            if result["content"]:
-                content += result["content"]
-                found = _find_sentinel_line(sentinel, content)
-                if found is not None:
-                    cut_idx, _line_end, exit_code = found
-                    content = content[:cut_idx]
-                    break
-            if timeout_ms <= 0:
-                break
-            if time.time() >= deadline:
-                break
-            time.sleep(max(0, poll_ms) / 1000.0)
-
-        if content:
-            cleaned_lines = []
-            for line in content.splitlines():
-                if token in line:
-                    continue
-                cleaned_lines.append(line)
-            content = "\n".join(cleaned_lines)
-
-        self._log_offsets[log_path] = offset
-        if last_size > self.max_log_bytes:
-            self._truncate_log_if_needed(log_path)
-        return {
-            "content": content,
-            "exit_code": exit_code,
-            "timed_out": timeout_ms > 0 and time.time() >= deadline and exit_code is None,
-            "truncated": truncated,
-            "sentinel": token,
-        }
-
     def tmux_cwd(self, session: Optional[str]) -> Dict[str, Any]:
         sess = self._ensure_tmux_session(session)
         quoted = shlex.quote(sess)
@@ -443,8 +460,8 @@ class TmuxClientBase:
 
 
 class SSHClient(TmuxClientBase):
-    def __init__(self, host: Optional[str], socket_path: str, root: Optional[str], tmux_session: Optional[str], timeout: int = DEFAULT_TIMEOUT, max_log_bytes: int = DEFAULT_MAX_LOG_BYTES):
-        super().__init__(max_log_bytes=max_log_bytes)
+    def __init__(self, host: Optional[str], socket_path: str, root: Optional[str], tmux_session: Optional[str], timeout: int = DEFAULT_TIMEOUT, max_log_bytes: int = DEFAULT_MAX_LOG_BYTES, prompt_timeout_ms: int = 30000):
+        super().__init__(max_log_bytes=max_log_bytes, prompt_timeout_ms=prompt_timeout_ms)
         self.host = host
         self.socket_path = socket_path
         self.root = posixpath.normpath(root) if root is not None else None
@@ -660,25 +677,6 @@ class SSHClient(TmuxClientBase):
         self.ssh(cmd)
         return {"ok": True}
 
-    def tmux_run(self, session: Optional[str], command: str, lines: int, delay_ms: int) -> Dict[str, Any]:
-        sess = self._ensure_tmux_session(session)
-        quoted = shlex.quote(sess)
-        key_arg = shlex.quote(command)
-        delay_arg = f"sleep {delay_ms / 1000.0} && " if delay_ms > 0 else ""
-        cmd = (
-            f"tmux send-keys -t {quoted} -- {key_arg} C-m && "
-            f"{delay_arg}"
-            f"tmux capture-pane -p -t {quoted} -S -{int(lines)}"
-        )
-        out = self.ssh(cmd)
-        return {"content": out}
-
-    def _send_keys_with_sentinel(self, quoted_session: str, key_arg: str, marker_cmd: str) -> None:
-        self.ssh(
-            f"tmux send-keys -t {quoted_session} -- {key_arg} C-m && "
-            f"tmux send-keys -t {quoted_session} -- {marker_cmd} C-m"
-        )
-
     def ssh_exec(self, command: str) -> Dict[str, Any]:
         out = self.ssh(command)
         return {"content": out}
@@ -710,8 +708,8 @@ class SSHClient(TmuxClientBase):
 
 
 class LocalClient(TmuxClientBase):
-    def __init__(self, tmux_session: Optional[str], log_path: Optional[str], timeout: int = DEFAULT_TIMEOUT, max_log_bytes: int = DEFAULT_MAX_LOG_BYTES) -> None:
-        super().__init__(max_log_bytes=max_log_bytes)
+    def __init__(self, tmux_session: Optional[str], log_path: Optional[str], timeout: int = DEFAULT_TIMEOUT, max_log_bytes: int = DEFAULT_MAX_LOG_BYTES, prompt_timeout_ms: int = 30000) -> None:
+        super().__init__(max_log_bytes=max_log_bytes, prompt_timeout_ms=prompt_timeout_ms)
         self.tmux_session = tmux_session or "shared-ai"
         self.log_path = log_path or "/tmp/ai-ssh/tmux.log"
         self.timeout = timeout
@@ -880,7 +878,7 @@ TOOLS = [
     },
     {
         "name": "tmux_send",
-        "description": "Send keys to a tmux session.",
+        "description": "Send keys to a tmux session. For interactive use only; prefer tmux_run for executing commands.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -893,14 +891,13 @@ TOOLS = [
     },
     {
         "name": "tmux_run",
-        "description": "Run a command in a tmux session and return recent output.",
+        "description": "Run a command in the tmux session and return its complete output. Waits for the shell to be ready, executes the command, and blocks until completion or timeout. Returns output and exit code. This is the primary tool for executing commands.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "session": {"type": "string"},
                 "command": {"type": "string"},
-                "lines": {"type": "integer"},
-                "delay_ms": {"type": "integer"},
+                "timeout_ms": {"type": "integer"},
             },
             "required": ["command"],
         },
@@ -915,36 +912,6 @@ TOOLS = [
                 "max_bytes": {"type": "integer"},
                 "reset": {"type": "boolean"},
             },
-        },
-    },
-    {
-        "name": "tmux_run_stream",
-        "description": "Run a command in tmux and return new output from the session log.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "session": {"type": "string"},
-                "command": {"type": "string"},
-                "max_bytes": {"type": "integer"},
-                "delay_ms": {"type": "integer"},
-            },
-            "required": ["command"],
-        },
-    },
-    {
-        "name": "tmux_run_sentinel",
-        "description": "Run a command in tmux and return output up to a sentinel marker.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "session": {"type": "string"},
-                "command": {"type": "string"},
-                "max_bytes": {"type": "integer"},
-                "delay_ms": {"type": "integer"},
-                "timeout_ms": {"type": "integer"},
-                "poll_ms": {"type": "integer"},
-            },
-            "required": ["command"],
         },
     },
     {
@@ -1011,30 +978,14 @@ def handle_call(client: Union[SSHClient, LocalClient], name: str, args: Dict[str
     if name == "tmux_send":
         return client.tmux_send(args.get("session"), args["keys"], bool(args.get("enter", True)))
     if name == "tmux_run":
-        lines = int(args.get("lines", 200))
-        delay_ms = int(args.get("delay_ms", 200))
-        return client.tmux_run(args.get("session"), args["command"], lines, delay_ms)
+        timeout_ms = args.get("timeout_ms")
+        if timeout_ms is not None:
+            timeout_ms = int(timeout_ms)
+        return client.tmux_run(args.get("session"), args["command"], timeout_ms)
     if name == "tmux_stream_read":
         max_bytes = int(args.get("max_bytes", 8192))
         reset = bool(args.get("reset", False))
         return client.tmux_stream_read(args.get("session"), max_bytes, reset)
-    if name == "tmux_run_stream":
-        max_bytes = int(args.get("max_bytes", 65536))
-        delay_ms = int(args.get("delay_ms", 300))
-        return client.tmux_run_stream(args.get("session"), args["command"], max_bytes, delay_ms)
-    if name == "tmux_run_sentinel":
-        max_bytes = int(args.get("max_bytes", 65536))
-        delay_ms = int(args.get("delay_ms", 200))
-        timeout_ms = int(args.get("timeout_ms", 15000))
-        poll_ms = int(args.get("poll_ms", 200))
-        return client.tmux_run_sentinel(
-            args.get("session"),
-            args["command"],
-            max_bytes,
-            delay_ms,
-            timeout_ms,
-            poll_ms,
-        )
     if name == "tmux_cwd":
         return client.tmux_cwd(args.get("session"))
     if name == "tmux_log_purge":
@@ -1054,6 +1005,7 @@ def main() -> None:
     parser.add_argument("--log-path", default=None, help="log path for local tmux capture")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help=f"SSH/command timeout in seconds (default: {DEFAULT_TIMEOUT})")
     parser.add_argument("--max-log-size", type=int, default=DEFAULT_MAX_LOG_BYTES, help=f"max tmux log size in bytes before truncation (default: {DEFAULT_MAX_LOG_BYTES})")
+    parser.add_argument("--prompt-timeout-ms", type=int, default=30000, help="default timeout for tmux_run in milliseconds (default: 30000)")
     args = parser.parse_args()
 
     _log(
@@ -1071,7 +1023,7 @@ def main() -> None:
 
     _log(f"resolved session: host={host} tmux={tmux_session}")
     if args.local:
-        client = LocalClient(tmux_session, args.log_path, timeout=args.timeout, max_log_bytes=args.max_log_size)
+        client = LocalClient(tmux_session, args.log_path, timeout=args.timeout, max_log_bytes=args.max_log_size, prompt_timeout_ms=args.prompt_timeout_ms)
         tools = TMUX_ONLY_TOOLS
         # Ensure local tmux session exists and pipe-pane is enabled.
         code, _out, _err = _run_cmd(["tmux", "has-session", "-t", tmux_session])
@@ -1080,6 +1032,8 @@ def main() -> None:
         os.makedirs(os.path.dirname(client.log_path), exist_ok=True)
         with open(client.log_path, "a", encoding="utf-8"):
             pass
+        # Close any existing pipe first (pipe-pane toggles, so a restart would turn it off)
+        _run_cmd(["tmux", "pipe-pane", "-t", tmux_session])
         _run_cmd(["tmux", "pipe-pane", "-o", "-t", tmux_session, f"cat >> {client.log_path}"])
         # Truncate log on startup if oversized
         try:
@@ -1091,7 +1045,7 @@ def main() -> None:
         except OSError:
             pass
     else:
-        client = SSHClient(host, args.socket, args.root, tmux_session, timeout=args.timeout, max_log_bytes=args.max_log_size)
+        client = SSHClient(host, args.socket, args.root, tmux_session, timeout=args.timeout, max_log_bytes=args.max_log_size, prompt_timeout_ms=args.prompt_timeout_ms)
         tools = TOOLS
         # Avoid SSH calls on startup so initialize can complete quickly.
 

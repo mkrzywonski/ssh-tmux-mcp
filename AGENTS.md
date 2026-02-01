@@ -3,7 +3,7 @@
 ## Project Structure & Module Organization
 This repository is a small Bash + Python toolset:
 - `ai-ssh`: Shell entrypoint that establishes the SSH ControlMaster and tmux session.
-- `mcp_server.py`: MCP server that exposes filesystem + tmux tools over the SSH socket.
+- `mcp_server.py`: MCP server that exposes filesystem + tmux tools over the SSH socket. `tmux_run` uses PS1 prompt markers for atomic command execution with exit code detection.
 - `README.md`: Usage notes and setup steps.
 There are no separate test or asset directories.
 
@@ -27,7 +27,7 @@ There is no automated test suite. Validate changes manually:
 
 ## Workflow Tips
 - Prefer `sftp_*` tools for file edits (read/modify/write) to avoid shell quoting issues.
-- Use tmux tools for commands, build output, and interactive steps (sudo prompts, long-running tasks).
+- Use `tmux_run` for commands — it blocks until done and returns exit code. Use `tmux_send` + `tmux_capture` for interactive programs (vim, sudo prompts).
 - Use `sftp_patch` for unified diffs when possible; fall back to read/modify/write if patching fails.
 
 ## Commit & Pull Request Guidelines

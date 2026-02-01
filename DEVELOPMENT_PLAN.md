@@ -68,12 +68,10 @@ Tracked improvements for ssh-tmux-mcp, ordered by priority.
 
 **Changes:**
 - Extracted `_find_sentinel_line` to a module-level function.
-- Created `TmuxClientBase` with all shared tmux methods: `tmux_capture`, `tmux_capture_scrollback`, `tmux_send`, `tmux_run`, `tmux_stream_read`, `tmux_run_stream`, `tmux_run_sentinel`, `tmux_cwd`.
+- Created `TmuxClientBase` with all shared tmux methods: `tmux_capture`, `tmux_capture_scrollback`, `tmux_send`, `tmux_run`, `tmux_stream_read`, `tmux_cwd`.
 - Subclasses implement 4 primitives: `_run_tmux`, `_read_stream_from_offset`, `_get_log_path`, `_ensure_tmux_session`.
-- `SSHClient` overrides `tmux_run` and `_send_keys_with_sentinel` to combine multiple tmux commands into single SSH calls (preserving Issue 6 optimization).
 - `LocalClient._run_tmux` uses `bash -c` to preserve shell quoting of the full tmux command string.
-- Net reduction of 75 lines despite all other feature additions.
-- All 46 tests pass across SSH, local, atomic write, and timeout test suites — no regressions.
+- All tests pass across SSH, local, atomic write, and timeout test suites — no regressions.
 
 ---
 
@@ -144,13 +142,12 @@ Tracked improvements for ssh-tmux-mcp, ordered by priority.
 
 ## Issue 11: Missing notifications/initialized handling
 
-**Status:** Pending
+**Status:** Done
 
 **Description:** The MCP spec expects the server to accept `notifications/initialized` after the initialize handshake. The server silently drops it, which works but makes debugging harder.
 
-**Plan:**
-- Add an explicit case for `notifications/initialized` (and the bare `initialized` variant) that logs receipt and continues.
-- No response is needed since it's a notification, not a request.
+**Changes:**
+- Added explicit case for `notifications/initialized` (and the bare `initialized` variant) that logs receipt and continues.
 
 ---
 
@@ -163,3 +160,21 @@ Tracked improvements for ssh-tmux-mcp, ordered by priority.
 **Changes:**
 - Added protocol negotiation that clamps to the server's supported version.
 - Invalid or missing client versions fall back to the server version.
+
+---
+
+## Issue 13: tmux_run should block until command completes
+
+**Status:** Done
+
+**Description:** `tmux_run` sent a command and immediately captured the pane, requiring callers to guess `delay_ms` or use `tmux_run_sentinel` with its fragile printf-based markers. Three separate tools (`tmux_run`, `tmux_run_stream`, `tmux_run_sentinel`) existed for variations of the same task.
+
+**Changes:**
+- Rewrote `tmux_run` to use a PS1 prompt marker for atomic command execution. On first call, it exports `PS1='__AISESS_{token}_$?__ \$ '` into the shell. Subsequent calls detect the marker in the log to determine when a command finishes and extract its exit code.
+- Returns `{content, exit_code, timed_out}` — behaves like `subprocess.run`.
+- Removed `tmux_run_stream`, `tmux_run_sentinel`, `_find_sentinel_line`, and `_send_keys_with_sentinel` (all subsumed by the PS1 approach).
+- Removed `SSHClient.tmux_run` override — base class works over SSH ControlMaster.
+- Added ANSI escape stripping for log output.
+- Fixed `pipe-pane -o` toggle bug: server startup now closes any existing pipe before opening a new one, preventing restarts from disabling the pipe.
+- Added `--prompt-timeout-ms` CLI arg (default 30000).
+- Tested on both local tmux and remote SSH: exit code 0, non-zero exit code, blocking sleep, timeout with `timed_out: true`.
